@@ -12,6 +12,7 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 
 # --- FUNCTIONS ---
 def get_user_data():
+    # ttl=0 ensures we always get the latest data from Google Drive
     return conn.read(worksheet="Users", ttl=0)
 
 def get_entry_data():
@@ -38,30 +39,34 @@ def initialize_user_entries(username):
             })
     return pd.DataFrame(new_rows)
 
-# --- AUTHENTICATION ---
+# --- AUTHENTICATION SETUP ---
 users_df = get_user_data()
 credentials = {"usernames": {}}
 
 for _, row in users_df.iterrows():
-    credentials["usernames"][row['username']] = {
-        "name": row['name'],
-        "password": str(row['password']) # Note: In production, use hashed passwords
+    credentials["usernames"][str(row['username'])] = {
+        "name": str(row['name']),
+        "password": str(row['password']) # Use hashed passwords for production
     }
 
-authenticator = stauth.Authenticate(credentials, "ramadan_tracker", "auth_key", cookie_expiry_days=30)
+# New version of Authenticate
+authenticator = stauth.Authenticate(
+    credentials, 
+    "ramadan_tracker_cookie", 
+    "abcdef", 
+    cookie_expiry_days=30
+)
 
-# --- MAIN UI ---
-tab_login, tab_signup = st.sidebar.tabs(["Login", "Sign Up"])
-
-with tab_signup:
-    st.subheader("নতুন অ্যাকাউন্ট")
+# --- SIDEBAR FOR SIGNUP ---
+st.sidebar.title("Ramadan App")
+with st.sidebar.expander("Register New User"):
     new_name = st.text_input("আপনার নাম")
-    new_user = st.text_input("ইউজারনেম (Unique)")
+    new_user = st.text_input("ইউজারনেম")
     new_pass = st.text_input("পাসওয়ার্ড", type="password")
     
     if st.button("রেজিস্ট্রেশন করুন"):
         if new_user in credentials["usernames"]:
-            st.error("এই ইউজারনেমটি ইতিমধ্যে আছে।")
+            st.error("ইউজারনেম ইতিমধ্যে আছে।")
         else:
             # 1. Update Users Sheet
             new_user_row = pd.DataFrame([{"username": new_user, "name": new_name, "password": new_pass}])
@@ -70,56 +75,72 @@ with tab_signup:
             
             # 2. Create 30 days of tasks for them
             new_entries = initialize_user_entries(new_user)
-            all_entries = pd.concat([get_entry_data(), new_entries], ignore_index=True)
-            conn.update(worksheet="Entries", data=all_entries)
+            existing_entries = get_entry_data()
+            final_entries = pd.concat([existing_entries, new_entries], ignore_index=True)
+            conn.update(worksheet="Entries", data=final_entries)
             
-            st.success("রেজিস্ট্রেশন সফল! এখন লগইন করুন।")
+            st.success("রেজিস্ট্রেশন সফল! লগইন করুন।")
 
-with tab_login:
-    name, authentication_status, username = authenticator.login("main")
+# --- LOGIN LOGIC ---
+# The login method no longer returns 3 values in recent versions
+authenticator.login(location='main')
 
-if authentication_status:
+if st.session_state["authentication_status"]:
     authenticator.logout('Logout', 'sidebar')
-    st.title(f"🌙 আসসালামু আলাইকুম, {name}!")
     
-    # LOAD AND FILTER DATA
+    # Access user info from session state
+    curr_name = st.session_state["name"]
+    curr_username = st.session_state["username"]
+    
+    st.title(f"🌙 আসসালামু আলাইকুম, {curr_name}!")
+    
+    # 1. LOAD AND FILTER DATA
     entries_df = get_entry_data()
-    user_entries = entries_df[entries_df['username'] == username].copy()
+    # Filter for the logged in user
+    user_entries = entries_df[entries_df['username'] == curr_username].copy()
     
-    # TRANSFORM DATA FOR HORIZONTAL VIEW (Pivoting like Excel)
-    # We want tasks as rows and Dates as columns
-    grid_df = user_entries.pivot_table(
-        index=['category', 'task'], 
-        columns='date', 
-        values='status', 
-        aggfunc='first'
-    ).reset_index()
+    if user_entries.empty:
+        st.warning("আপনার কোন ডাটা পাওয়া যায়নি। এডমিনকে যোগাযোগ করুন।")
+    else:
+        # 2. CREATE THE GRID (Dates as columns)
+        grid_df = user_entries.pivot_table(
+            index=['category', 'task'], 
+            columns='date', 
+            values='status', 
+            aggfunc='first'
+        ).reset_index()
 
-    st.subheader("আপনার ৩০ দিনের আমলনামা (Ramadan 2026)")
-    
-    # INTERACTIVE GRID
-    edited_grid = st.data_editor(
-        grid_df,
-        column_config={date: st.column_config.CheckboxColumn(date[5:]) for date in grid_df.columns if '-' in date},
-        disabled=["category", "task"],
-        hide_index=True
-    )
-
-    if st.button("Save My Progress"):
-        # Reverse Pivot to save back to "Flat" Google Sheet format
-        updated_user_entries = edited_grid.melt(
-            id_vars=['category', 'task'], 
-            var_name='date', 
-            value_name='status'
+        st.subheader("আপনার ৩০ দিনের আমলনামা")
+        
+        # 3. INTERACTIVE DATA EDITOR
+        edited_grid = st.data_editor(
+            grid_df,
+            column_config={
+                date: st.column_config.CheckboxColumn(date[8:10], help=date) 
+                for date in grid_df.columns if '-' in str(date)
+            },
+            disabled=["category", "task"],
+            hide_index=True
         )
-        updated_user_entries['username'] = username
-        
-        # Merge back with other users' data
-        other_users_entries = entries_df[entries_df['username'] != username]
-        final_df = pd.concat([other_users_entries, updated_user_entries], ignore_index=True)
-        
-        conn.update(worksheet="Entries", data=final_df)
-        st.success("আপনার প্রগতি সেভ করা হয়েছে!")
 
-elif authentication_status == False:
-    st.error('ইউজারনেম অথবা পাসওয়ার্ড ভুল।')
+        # 4. SAVE BACK TO GOOGLE DRIVE
+        if st.button("Save Changes"):
+            # Transform back to 'Flat' format (Melt)
+            updated_user_entries = edited_grid.melt(
+                id_vars=['category', 'task'], 
+                var_name='date', 
+                value_name='status'
+            )
+            updated_user_entries['username'] = curr_username
+            
+            # Merge with other users' data so we don't overwrite them
+            other_users_entries = entries_df[entries_df['username'] != curr_username]
+            final_save_df = pd.concat([other_users_entries, updated_user_entries], ignore_index=True)
+            
+            conn.update(worksheet="Entries", data=final_save_df)
+            st.success("আপনার প্রগতি Google Drive এ সেভ করা হয়েছে!")
+
+elif st.session_state["authentication_status"] is False:
+    st.error('Username/password is incorrect')
+elif st.session_state["authentication_status"] is None:
+    st.info('অনুগ্রহ করে লগইন করুন।')
